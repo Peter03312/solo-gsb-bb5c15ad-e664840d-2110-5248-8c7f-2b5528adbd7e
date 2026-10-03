@@ -302,6 +302,73 @@ def get_latest_payload(cur: psycopg.Cursor, point_id: int) -> dict | None:
     ).fetchone()
 
 
+# ---------------------------------------------------------------------------
+# Publish impact preview (只读影响预演) — read-only queries
+# ---------------------------------------------------------------------------
+
+def get_preview_base(
+    cur: psycopg.Cursor, point_id: int, expected_version: int
+) -> tuple[dict, dict]:
+    """Read-only base of a publish impact preview: ``(point, current_payload)``.
+
+    Mirrors the formal publish preconditions without taking any lock or
+    writing anything: the point must exist and ``expected_version`` must
+    match the current version, otherwise the same 404 / 409
+    ``version_conflict`` a formal publish would raise is raised — a stale
+    preview is never returned.  When nothing is published yet (version 0)
+    the current payload is the empty rule set.
+    """
+    point = get_point(cur, point_id)
+    current = point["version"]
+    if current != expected_version:
+        raise VersionConflictError(
+            f"expected version {expected_version} but point {point_id} is at "
+            f"version {current}",
+            details={"expected_version": expected_version, "current_version": current},
+        )
+    row = get_latest_payload(cur, point_id)
+    payload = (
+        row["payload"]
+        if row is not None
+        else {"weekly": [], "closed_dates": [], "makeup": []}
+    )
+    return point, payload
+
+
+def get_preview_impact_rows(
+    cur: psycopg.Cursor, point_id: int, now: datetime
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Windows a proposed rule set is previewed against (pure read).
+
+    Returns ``(reservations, locks, waitlist_entries)``:
+
+    * non-cancelled reservations not yet finished at ``now`` — the same set
+      the publish-time change protection validates;
+    * *valid* slot locks (status ``locked`` whose confirmation deadline is
+      still in the future at ``now``) not yet finished — an expired lock is
+      simply not listed; the preview never sweeps it;
+    * waiting waitlist entries not yet finished.
+    """
+    reservations = cur.execute(
+        "SELECT id, start_utc, end_utc, rules_version FROM reservations "
+        "WHERE point_id = %s AND status = 'active' AND end_utc > %s ORDER BY id",
+        (point_id, now),
+    ).fetchall()
+    locks = cur.execute(
+        "SELECT id, start_utc, end_utc, rules_version, expires_at "
+        "FROM slot_locks "
+        "WHERE point_id = %s AND status = 'locked' AND expires_at > %s "
+        "AND end_utc > %s ORDER BY id",
+        (point_id, now, now),
+    ).fetchall()
+    waitlist = cur.execute(
+        "SELECT id, start_utc, end_utc, rules_version FROM waitlist_entries "
+        "WHERE point_id = %s AND status = 'waiting' AND end_utc > %s ORDER BY id",
+        (point_id, now),
+    ).fetchall()
+    return reservations, locks, waitlist
+
+
 def get_active_reservation_windows(
     cur: psycopg.Cursor,
     point_id: int,

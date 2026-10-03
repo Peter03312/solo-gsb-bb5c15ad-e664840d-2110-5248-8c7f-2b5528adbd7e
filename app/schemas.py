@@ -688,3 +688,90 @@ class RecurringReservationOut(BaseModel):
     weeks: int
     created_at: datetime
     visits: list[RecurringVisitOut]
+
+
+# ---------------------------------------------------------------------------
+# Publish impact preview (只读影响预演)
+# ---------------------------------------------------------------------------
+
+#: The single reason a preview lists a booking as affected: under the
+#: proposed rules its window is no longer fully inside one continuous open
+#: interval (the same condition the ``outside_open_hours`` error names).
+PREVIEW_REASON_OUTSIDE_OPEN_HOURS = "outside_open_hours"
+
+
+class PreviewIntervalOut(BaseModel):
+    """One UTC half-open interval ``[start, end)`` of a preview diff."""
+
+    start: str
+    end: str
+
+
+class PreviewDayOut(BaseModel):
+    """Open-hours difference for one local day; only changed days appear."""
+
+    local_date: date
+    added: list[PreviewIntervalOut]
+    removed: list[PreviewIntervalOut]
+
+
+class PreviewAffectedReservationOut(BaseModel):
+    """A non-cancelled reservation losing full open coverage under the proposal."""
+
+    id: int
+    start: str
+    end: str
+    rules_version: int
+    reason: str
+    uncovered: list[PreviewIntervalOut]
+
+
+class PreviewAffectedLockOut(BaseModel):
+    """A valid (unexpired, unconfirmed) slot lock losing full open coverage."""
+
+    id: int
+    start: str
+    end: str
+    rules_version: int
+    expires_at: datetime
+    reason: str
+    uncovered: list[PreviewIntervalOut]
+
+
+class PreviewAffectedWaitlistOut(BaseModel):
+    """A waiting waitlist entry losing full open coverage under the proposal."""
+
+    id: int
+    start: str
+    end: str
+    rules_version: int
+    reason: str
+    uncovered: list[PreviewIntervalOut]
+
+
+class PublishPreviewOut(BaseModel):
+    """Read-only impact preview of a would-be rule publication (只读影响预演).
+
+    The answer is derived from one committed snapshot at one server-side
+    timestamp (``sampled_at``) and bases on ``base_version`` — the published
+    version the caller saw and named as ``expected_version``.  ``days``
+    lists, per local day with any difference, the added/removed UTC
+    half-open open intervals between the current and the proposed rules
+    over ``[date_from, date_to]`` (today at the point through the furthest
+    bookable day); source/label-only changes are not differences.  The
+    ``affected_*`` lists name every non-cancelled reservation, valid lock
+    and waiting waitlist entry whose window would lose full continuous open
+    coverage under the proposed rules.  Nothing is published, booked, swept
+    or promoted by a preview.
+    """
+
+    point_id: int
+    base_version: int
+    sampled_at: str
+    timezone: str
+    date_from: date
+    date_to: date
+    days: list[PreviewDayOut]
+    affected_reservations: list[PreviewAffectedReservationOut]
+    affected_locks: list[PreviewAffectedLockOut]
+    affected_waitlist: list[PreviewAffectedWaitlistOut]

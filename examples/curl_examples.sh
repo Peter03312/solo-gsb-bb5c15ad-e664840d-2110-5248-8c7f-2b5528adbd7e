@@ -215,6 +215,41 @@ api POST "/points/$RPID/rules" '{
 }'
 
 echo
+echo "== 7b. Publish impact preview (只读影响预演): dry-run a rule change =="
+# Same request shape as a formal publish (expected_version + full rules),
+# but read-only: it never publishes, books, sweeps locks or promotes anyone.
+echo "-- preview narrowing the 08:00-12:00 rule to 08:00-09:30 (200) --"
+api POST "/points/$RPID/rules/preview" "{
+  \"expected_version\": 1,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"09:30\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+# -> 200: base_version + one sampled_at server timestamp; days lists the
+#    removed 09:30-12:00 UTC interval on each matching local day; and
+#    affected_reservations names both live visits (09:00-10:00 loses its
+#    09:30-10:00 tail, 10:00-11:00 loses its whole window) with reason
+#    "outside_open_hours" and the uncovered UTC slices.  The point is still
+#    at version 1 afterwards and every booking is unchanged.
+
+echo
+echo "-- a stale expected_version conflicts instead of answering (409) --"
+api POST "/points/$RPID/rules/preview" '{
+  "expected_version": 0,
+  "rules": {"weekly": [], "closed_dates": [], "makeup": []}
+}'
+
+echo
+echo "-- invalid proposed rules are rejected (422 invalid_period) --"
+api POST "/points/$RPID/rules/preview" '{
+  "expected_version": 1,
+  "rules": {"weekly": [{"weekday": 2, "start_time": "10:00", "end_time": "10:00"}],
+            "closed_dates": [], "makeup": []}
+}'
+
+echo
 echo "-- cancel with a wrong token (403 invalid_cancel_token) --"
 api POST "/points/$RPID/reservations/$RID/cancel" '{"cancel_token":"wrong"}'
 

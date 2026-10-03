@@ -346,6 +346,35 @@ def build_open_intervals(
     return [(start, end) for start, end, _sources in _merge_pieces(all_pieces)]
 
 
+def subtract_intervals(
+    base: list[tuple[datetime, datetime]],
+    minus: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Return the portions of ``base`` not covered by ``minus``.
+
+    Both inputs are sorted lists of non-overlapping half-open UTC intervals
+    ``[start, end)``; the result is sorted and non-overlapping too.  Used to
+    diff two calendars (added/removed open hours) and to report the
+    uncovered part of a booking window under a proposed rule set.
+    """
+    result: list[tuple[datetime, datetime]] = []
+    for start, end in base:
+        cursor = start
+        for m_start, m_end in minus:
+            if m_end <= cursor:
+                continue
+            if m_start >= end:
+                break
+            if m_start > cursor:
+                result.append((cursor, m_start))
+            cursor = m_end
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
 def weekly_windows(
     tz_name: str,
     first_day: date,

@@ -18,7 +18,13 @@
 一次预约 2～4 个连续周，按回收点时区逐周换算 UTC 并逐周沿用单站预约
 全部规则，任一周不合规则整组不占位并指出失败周；成功后各周是可凭
 各自凭证独立取消/改期/签到/离场的普通预约，同点同键同内容重试重放
-首次创建的各周窗口并反映当前状态，失败不消耗键）。
+首次创建的各周窗口并反映当前状态，失败不消耗键），以及管理员调整
+开放规则前的**只读影响预演**（以所见已发布版本与拟提交的完整规则
+请求预演：沿用发布的结构校验与版本冲突语义，在同一已提交视图与一次
+服务端时刻下比较从当前起至最远可约日的现行与拟定开放区间，按回收点
+当地日列出新增/减少的 UTC 半开区间，并逐条列出将失去完整连续开放
+覆盖的未取消预约、有效锁定与排队中候补及原因；预演不发布、不占名额、
+不清理锁定、不转正候补，之后正式发布仍按提交时状态校验）。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -127,6 +133,27 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 每次日历查询在 `REPEATABLE READ` 事务里读取**同一个已发布版本**的完整规则；
     也可用 `?version=N` 显式固定到某个历史已发布版本。
   - 新建回收点版本号为 `0`，表示“尚无已发布规则”。
+- **规则发布影响预演（只读）**：管理员在调整开放规则前，可用与正式发布
+  **相同的请求体**（`expected_version` + 完整规则）请求只读预演：
+  - 先沿用发布的结构校验（非法规则返回与发布相同的 `422 invalid_period`
+    等错误，且不改任何状态）；`expected_version` 与当前版本不符返回
+    `409 version_conflict`，**不返回过期预演**；
+  - 预演在单个 `REPEATABLE READ` 事务的**同一已提交视图**上、以**一次服务端
+    时刻 `sampled_at`** 计算：比较从当前起至最远可约日
+    （`RESERVATION_MAX_DAYS_AHEAD`，默认 30 天）的现行与拟定开放区间，按
+    回收点当地日列出**新增 `added` 与减少 `removed`** 的 UTC 半开区间
+    （仅列有差异的日期；首日区间按 `sampled_at` 裁切，已过去的时刻不参与
+    比较；**仅来源/标签变化不算时段变化**；跨午夜与夏令时按现有日历规则
+    展开）；
+  - 逐条列出若采用拟定规则将**失去完整连续开放覆盖**的未取消预约
+    （`active` 且尚未结束）、**有效锁定**（`locked` 且未到期）与**排队中
+    候补**（`waiting`），附原因 `outside_open_hours` 与未被覆盖的 UTC 片段
+    `uncovered`；**跨预演日期边界的窗口按整段判断**（连续开放区间不在当地
+    午夜切开，覆盖计算延伸到完整包含整个窗口），**已过期锁定不列入**；
+  - 预演**只读**：不发布版本、不占名额、不清理到期锁定、不转正候补、不消耗
+    任何幂等键；之后的正式发布仍在提交时按当时状态重新校验（预演通过不构成
+    发布成功的保证，预演列出的预约/锁定正是正式发布会以
+    `reservation_change_conflict` 拒绝的对象）。
 - **到访预约**：
   - 预约以**当前已发布**的服务日历为准：请求给出 UTC 起止与客户幂等键，
     起点须在 `RESERVATION_MAX_DAYS_AHEAD`（默认 30）天内且不早于当前时刻，
@@ -376,6 +403,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/points/{id}/rules` | 条件式、原子地发布整套规则（201） |
+| `POST` | `/points/{id}/rules/preview` | 只读影响预演：按正式发布同样的校验预演拟提交规则（200），不发布、不改任何状态 |
 | `GET` | `/points/{id}/rules` | 读取当前已发布版本 |
 | `GET` | `/points/{id}/rules/versions` | 已发布版本列表（新到旧） |
 | `GET` | `/points/{id}/rules/versions/{version}` | 读取指定历史版本 |
@@ -399,6 +427,71 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 时间均为 `HH:MM`（当地挂钟时间，秒可选）。成功返回新版本号与发布时间。
+
+#### 只读影响预演（`POST /points/{id}/rules/preview`）
+
+请求体与正式发布**完全相同**（`expected_version` + 整套 `rules`），校验也
+完全相同：结构非法返回 `422 invalid_period` / `invalid_request`；
+`expected_version` 与当前版本不符返回 `409 version_conflict`（`details`
+给出双方版本号），不返回过期预演；回收点不存在返回 `404 point_not_found`。
+尚未发布过规则的回收点可以 `expected_version: 0` 预演（现行规则按空规则
+集比较，拟定区间全部为新增）。
+
+成功响应（200）——依据版本、取样时刻、差异与受影响编号：
+
+```json
+{
+  "point_id": 1,
+  "base_version": 3,
+  "sampled_at": "2026-10-03T08:00:00Z",
+  "timezone": "Asia/Shanghai",
+  "date_from": "2026-10-03",
+  "date_to": "2026-11-02",
+  "days": [
+    {
+      "local_date": "2026-10-05",
+      "added": [
+        { "start": "2026-10-05T04:00:00Z", "end": "2026-10-05T06:00:00Z" }
+      ],
+      "removed": [
+        { "start": "2026-10-05T01:00:00Z", "end": "2026-10-05T02:00:00Z" }
+      ]
+    }
+  ],
+  "affected_reservations": [
+    {
+      "id": 7,
+      "start": "2026-10-05T01:30:00Z",
+      "end": "2026-10-05T02:30:00Z",
+      "rules_version": 3,
+      "reason": "outside_open_hours",
+      "uncovered": [
+        { "start": "2026-10-05T02:00:00Z", "end": "2026-10-05T02:30:00Z" }
+      ]
+    }
+  ],
+  "affected_locks": [],
+  "affected_waitlist": []
+}
+```
+
+- `base_version`：预演所依据的当前已发布版本（与通过的 `expected_version`
+  一致；尚无已发布规则时为 `0`）。
+- `sampled_at`：本次预演唯一的服务端取样时刻；比较范围、锁定有效性与
+  “尚未结束”判定都以它为准。
+- `date_from` / `date_to`：比较的当地日期范围——从当前当地日起至最远可约日
+  （`RESERVATION_MAX_DAYS_AHEAD` 天）止。
+- `days`：仅列**有差异**的当地日；`added` / `removed` 为 UTC 半开区间
+  `[start, end)`。仅来源或标签变化（如同一时段改挂 `label`、weekly 换成等效
+  makeup）不产生差异；首日区间按 `sampled_at` 裁切。
+- `affected_reservations` / `affected_locks` / `affected_waitlist`：若采用
+  拟定规则将失去完整连续开放覆盖的未取消预约、有效锁定与排队中候补，按编号
+  升序列出；`reason` 恒为 `outside_open_hours`，`uncovered` 给出窗口中不再被
+  覆盖的 UTC 片段（跨午夜的窗口按整段判断，不在午夜处切开）；已取消预约、
+  已过期锁定、已转正/已撤回/已失效候补不列入。
+- 预演**只读**：不发布版本、不占名额、不清理到期锁定、不转正候补、不消耗
+  幂等键；之后的正式发布仍按提交时状态校验，以 `POST /points/{id}/rules`
+  的实际结果为准。
 
 ### 4.3 日历查询
 
@@ -1106,7 +1199,7 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
 | 404 | `reservation_not_found` | 预约号不存在（或不属于该回收点） |
 | 403 | `invalid_cancel_token` | 取消/改期/改派时未提供凭证或凭证不匹配 |
 | 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或创建预约；改派目标点无已发布规则；行程预约/规划搜索任一站点无已发布规则；连续周循环预约的回收点无已发布规则 |
-| 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号） |
+| 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号）；只读影响预演（`POST /points/{id}/rules/preview`）同此语义，不返回过期预演 |
 | 409 | `idempotency_conflict` | 同一幂等作用域同键提交了不同内容（`details` 给出已存内容；改派作用域为原预约；行程作用域为全局行程键，按完整有序站点内容判重；锁定作用域为回收点；连续周循环预约作用域为回收点，按首日/挂钟时间/周数判重） |
 | 409 | `reservation_overlap` | 请求窗口 `[起, 止)` 内某时刻占用数（未取消预约 + 有效锁定）已达到该点容量（创建预约/锁定时；改期时忽略自身；改派时按目标点判定；行程按各站回收点判定；连续周循环预约按各周判定）。按 `[起, 止)` 计算，首尾相接不计并发；`details` 给出 `conflicting_reservation_ids`、`conflicting_lock_ids`、`capacity`、`peak_concurrency`，行程另附失败站，循环预约另附失败周 `week`/`local_date` |
 | 409 | `capacity_conflict` | 下调容量至低于某未来时刻（含进行中预约）占用数（未取消预约 + 有效锁定）时拒绝（`details` 给出 `requested_capacity` / `current_capacity` / `future_peak_concurrency`），原容量不变 |
@@ -1124,7 +1217,7 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
 | 404 | `lock_not_found` | 锁定号不存在（或不属于该回收点） |
 | 403 | `invalid_confirm_token` | 确认锁定时未提供确认凭证或凭证不匹配 |
 | 409 | `lock_expired` | 锁定已过确认期限（`details` 附 `expires_at` 与 `now`），不能再转为预约 |
-| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补、改派与锁定窗口同样适用预约时段策略；行程站点未按到访先后排列（前站结束晚于后站开始，`details` 附 `stop_index`）；行程规划搜索起止倒置或跨度超过 `TRIP_SEARCH_MAX_DAYS`（默认 7 天）、某站停留分钟数超过现有单站预约时长上限（`details` 附 `stop_index`/`point_id`）；连续周循环预约的挂钟时间格式非法、或某周换算后的窗口不满足上述预约时段策略（失败周附 `week`/`local_date`） |
+| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补、改派与锁定窗口同样适用预约时段策略；行程站点未按到访先后排列（前站结束晚于后站开始，`details` 附 `stop_index`）；行程规划搜索起止倒置或跨度超过 `TRIP_SEARCH_MAX_DAYS`（默认 7 天）、某站停留分钟数超过现有单站预约时长上限（`details` 附 `stop_index`/`point_id`）；连续周循环预约的挂钟时间格式非法、或某周换算后的窗口不满足上述预约时段策略（失败周附 `week`/`local_date`）；只读影响预演的拟定规则沿用发布的同一套结构校验 |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
 | 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳缺时区偏移、行程站数不在 2～5 等）；改派目标点与原点相同；同一行程内回收点重复；行程规划搜索站数不在 2～5、点重复、负的站间间隔或搜索时间戳缺时区偏移；连续周循环预约的连续周数不在 2～4 |
 
@@ -1240,6 +1333,34 @@ curl -s 'localhost:8000/points/1/waitlist/3?query_token=<query_token>'
 curl -s -X POST localhost:8000/points/1/waitlist/3/withdraw \
   -H 'Content-Type: application/json' \
   -d '{"query_token":"<query_token>"}'
+```
+
+规则发布影响预演快速体验（回收点 `1` 当前版本为 `3`，有预约落在明天
+09:00-10:00；请求体与正式发布完全相同，但**只读**）：
+
+```bash
+# 预演「缩短开放到 08:00-09:30」的影响：同一已提交视图 + 一次服务端时刻
+curl -s -X POST localhost:8000/points/1/rules/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version":3,
+       "rules":{"weekly":[{"weekday":4,"start_time":"08:00","end_time":"09:30"}],
+                "closed_dates":[],"makeup":[]}}'
+# -> 200：base_version（依据版本）、sampled_at（取样时刻）、
+#    days（从当前起至最远可约日、按当地日列出的新增/减少 UTC 半开区间，
+#    仅列有差异的日期）、affected_reservations / affected_locks /
+#    affected_waitlist（将失去完整连续开放覆盖的编号、原因
+#    outside_open_hours 与未覆盖片段 uncovered）。
+#    预演不发布、不占名额、不清理锁定、不转正候补：版本仍为 3，各对象状态不变。
+
+# 版本已变化 -> 409 version_conflict（不返回过期预演）；
+# 非法规则 -> 422 invalid_period，同样不改任何状态。
+# 之后正式发布仍按提交时状态校验：
+curl -s -X POST localhost:8000/points/1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version":3,
+       "rules":{"weekly":[{"weekday":4,"start_time":"08:00","end_time":"09:30"}],
+                "closed_dates":[],"makeup":[]}}'
+# -> 若预演列出的预约/锁定仍存在：409 reservation_change_conflict。
 ```
 
 行程快速体验（回收点 `1`、`2` 均已发布覆盖对应时段的规则）：
@@ -1504,6 +1625,16 @@ pytest -q
   一小时）、跨午夜逐周次日结束；API 端到端在可约期限内遇到真实 DST
   切换周时校验换算结果；并发同窗口整组恰好一方成功、并发同键同内容
   恰好一方创建另一方重放，不双占、不死锁。
+- 规则发布影响预演（本轮）：按当地日列出的新增/减少 UTC 半开区间差异
+  （首日按取样时刻裁切、仅列有差异日期、来源/标签变化不算差异、跨午夜
+  场次按现有日历规则展开）、相同规则零差异、版本冲突不返回过期预演、
+  非法规则 422 且不改任何状态、未知回收点 404、未发布点按空规则集比较
+  （拟定区间全为新增）、失去完整连续开放覆盖的未取消预约/有效锁定/排队
+  中候补逐条列出（含原因与未覆盖片段；已取消预约与已过期锁定不列入）、
+  跨午夜窗口按整段判断、预演只读（版本号/锁定状态/候补队列/预约状态均
+  不变）且之后正式发布仍按提交时状态校验（预演列出的编号正是
+  `reservation_change_conflict` 拒绝的对象）、预演与发布并发下结果一致
+  且无 500；半开区间差集引擎单测。
 - 全部可区分错误码。
 
 ---
@@ -1514,13 +1645,13 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补/名额锁定/连续周循环预约存储、签到/离场记录（行锁 + 事务 + 释放转正扫描 + 到期锁定清理 + 有效占用口径）
-  scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间/逐周挂钟时段换算）
+  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补/名额锁定/连续周循环预约存储、签到/离场记录、发布影响预演只读查询（行锁 + 事务 + 释放转正扫描 + 到期锁定清理 + 有效占用口径）
+  scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间/逐周挂钟时段换算/半开区间差集）
   planner.py     纯 Python 只读行程规划引擎（逐站最早可行起点、半开容量满额区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验
   errors.py      可区分错误类型
   main.py        FastAPI 路由与错误处理
-examples/        curl 与 Python 调用示例（含候补、改派、行程、名额锁定、签到/离场与连续周循环预约全流程）
-tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派、行程、名额锁定、签到/离场与连续周循环预约）
+examples/        curl 与 Python 调用示例（含候补、改派、行程、名额锁定、签到/离场、连续周循环预约与发布影响预演全流程）
+tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派、行程、名额锁定、签到/离场、连续周循环预约与发布影响预演）
 Dockerfile, docker-compose.yml
 ```

@@ -214,6 +214,44 @@ def main() -> None:
     )
     show("creation key replay still returns the original window", status, create_replay)
 
+    # ------------------------------------------------------------------
+    # Publish impact preview (只读影响预演): dry-run a would-be publication.
+    # Same request shape as a formal publish, but read-only — it answers
+    # from one committed snapshot at one server timestamp and changes
+    # nothing (no version is published, no lock swept, nobody promoted).
+    # ------------------------------------------------------------------
+    status, impact = call(
+        "POST",
+        f"/points/{rpid}/rules/preview",
+        {
+            "expected_version": 1,
+            "rules": {"weekly": [], "closed_dates": [], "makeup": []},
+        },
+    )
+    show(
+        "preview emptying the rules (200: base_version, sampled_at, per-day "
+        "added/removed UTC intervals, affected reservation ids + uncovered "
+        "slices)",
+        status,
+        impact,
+    )
+
+    status, stale_preview = call(
+        "POST",
+        f"/points/{rpid}/rules/preview",
+        {
+            "expected_version": 0,  # stale: the point is at version 1
+            "rules": {"weekly": [], "closed_dates": [], "makeup": []},
+        },
+    )
+    show(
+        "a stale expected_version conflicts instead of answering (409)",
+        status,
+        stale_preview,
+    )
+
+    # The formal publish below still validates at its own submission time —
+    # the preview neither published anything nor weakened the protection.
     status, blocked = call(
         "POST",
         f"/points/{rpid}/rules",

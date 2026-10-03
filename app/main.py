@@ -43,7 +43,14 @@ from .schemas import (
     PointCreateIn,
     PointOut,
     PointUpdateIn,
+    PREVIEW_REASON_OUTSIDE_OPEN_HOURS,
+    PreviewAffectedLockOut,
+    PreviewAffectedReservationOut,
+    PreviewAffectedWaitlistOut,
+    PreviewDayOut,
+    PreviewIntervalOut,
     PublishOut,
+    PublishPreviewOut,
     PublishRulesIn,
     ReassignOut,
     RecurringReservationCreateIn,
@@ -75,7 +82,13 @@ from .schemas import (
     validate_rules_payload,
     validate_timezone,
 )
-from .scheduler import build_calendar, build_open_intervals, get_zone, weekly_windows
+from .scheduler import (
+    build_calendar,
+    build_open_intervals,
+    get_zone,
+    subtract_intervals,
+    weekly_windows,
+)
 from .planner import StopSpec, plan_itinerary
 from .db import payload_to_ruleset
 
@@ -290,6 +303,194 @@ def read_rule_version(point_id: int, version: int) -> VersionOut:
         version=row["version"],
         published_at=row["published_at"],
         rules=row["payload"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Publish impact preview (只读影响预演) — read-only dry-run of a publication
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/points/{point_id}/rules/preview",
+    response_model=PublishPreviewOut,
+    tags=["rules"],
+)
+def preview_rules_impact(point_id: int, body: PublishRulesIn) -> PublishPreviewOut:
+    """Read-only impact preview of a would-be rule publication (只读影响预演).
+
+    The request is validated exactly like a formal publish — the same
+    structural rule checks and the same optimistic ``expected_version``
+    check (a stale version conflicts and no preview is returned) — but the
+    answer is computed from one REPEATABLE READ snapshot at one server-side
+    timestamp and changes nothing: no version is published, no capacity is
+    held, no lock is swept and no waitlist entry is promoted.  A later
+    formal publish re-validates against the state at its own submission
+    time.
+    """
+    # Semantic validation (invalid periods, duplicates) before touching the
+    # DB — exactly the publish endpoint's structural checks.
+    payload = validate_rules_payload(body.rules)
+    # One server timestamp governs the whole preview: the comparison range,
+    # lock validity and the not-yet-finished filters all derive from it.
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        # Repeatable-read snapshot: the point row, the published rules and
+        # every booking window the answer is derived from come from one
+        # committed view, even if a concurrent publish commits mid-preview.
+        previous_level = connection.isolation_level
+        connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        try:
+            with connection.transaction():
+                cur = connection.cursor()
+                point, current_payload = db.get_preview_base(
+                    cur, point_id, body.expected_version
+                )
+                reservations, locks, waitlist = db.get_preview_impact_rows(
+                    cur, point_id, now
+                )
+        finally:
+            connection.isolation_level = previous_level
+
+    timezone_name = point["timezone"]
+    zone = get_zone(timezone_name)
+    # From the current local day through the furthest bookable day.
+    date_from = now.astimezone(zone).date()
+    date_to = (
+        now + timedelta(days=settings.reservation_max_days_ahead)
+    ).astimezone(zone).date()
+
+    current_ruleset = payload_to_ruleset(current_payload)
+    proposed_ruleset = payload_to_ruleset(payload)
+
+    # Per-local-day diff of the open intervals, clipped to [now, ...): only
+    # instants that can still change hands are compared.  Interval sources
+    # are ignored on purpose — a pure provenance/label change is not a
+    # change of the open hours.
+    current_days = build_calendar(
+        timezone_name, current_ruleset, date_from, date_to
+    )
+    proposed_days = build_calendar(
+        timezone_name, proposed_ruleset, date_from, date_to
+    )
+    days_out: list[PreviewDayOut] = []
+    for current_day, proposed_day in zip(current_days, proposed_days):
+        current_intervals = [
+            (max(start, now), end)
+            for start, end, _sources in current_day.intervals
+            if end > now
+        ]
+        proposed_intervals = [
+            (max(start, now), end)
+            for start, end, _sources in proposed_day.intervals
+            if end > now
+        ]
+        removed = subtract_intervals(current_intervals, proposed_intervals)
+        added = subtract_intervals(proposed_intervals, current_intervals)
+        if added or removed:
+            days_out.append(
+                PreviewDayOut(
+                    local_date=current_day.local_date,
+                    added=[
+                        PreviewIntervalOut(start=utc_iso(start), end=utc_iso(end))
+                        for start, end in added
+                    ],
+                    removed=[
+                        PreviewIntervalOut(start=utc_iso(start), end=utc_iso(end))
+                        for start, end in removed
+                    ],
+                )
+            )
+
+    # Whole-segment coverage judgement under the proposed rules: continuous
+    # open intervals (never clipped at local midnights) expanded over a
+    # range that fully contains every candidate window, so a window
+    # crossing a preview day boundary — or spilling past the furthest
+    # bookable day — is still judged as one segment.
+    all_rows = [*reservations, *locks, *waitlist]
+    if all_rows:
+        first_day = min(
+            date_from,
+            min(row["start_utc"] for row in all_rows).astimezone(zone).date(),
+        )
+        last_day = max(
+            date_to,
+            max(row["end_utc"] for row in all_rows).astimezone(zone).date(),
+        )
+    else:
+        first_day, last_day = date_from, date_to
+    proposed_open = build_open_intervals(
+        timezone_name,
+        proposed_ruleset,
+        first_day - timedelta(days=1),
+        last_day + timedelta(days=1),
+    )
+
+    def _uncovered(
+        start: datetime, end: datetime
+    ) -> list[PreviewIntervalOut] | None:
+        """None when the window keeps full continuous coverage, else the lost parts."""
+        if any(s <= start and end <= e for s, e in proposed_open):
+            return None
+        return [
+            PreviewIntervalOut(start=utc_iso(s), end=utc_iso(e))
+            for s, e in subtract_intervals([(start, end)], proposed_open)
+        ]
+
+    affected_reservations: list[PreviewAffectedReservationOut] = []
+    for row in reservations:
+        lost = _uncovered(row["start_utc"], row["end_utc"])
+        if lost is not None:
+            affected_reservations.append(
+                PreviewAffectedReservationOut(
+                    id=row["id"],
+                    start=utc_iso(row["start_utc"]),
+                    end=utc_iso(row["end_utc"]),
+                    rules_version=row["rules_version"],
+                    reason=PREVIEW_REASON_OUTSIDE_OPEN_HOURS,
+                    uncovered=lost,
+                )
+            )
+    affected_locks: list[PreviewAffectedLockOut] = []
+    for row in locks:
+        lost = _uncovered(row["start_utc"], row["end_utc"])
+        if lost is not None:
+            affected_locks.append(
+                PreviewAffectedLockOut(
+                    id=row["id"],
+                    start=utc_iso(row["start_utc"]),
+                    end=utc_iso(row["end_utc"]),
+                    rules_version=row["rules_version"],
+                    expires_at=row["expires_at"],
+                    reason=PREVIEW_REASON_OUTSIDE_OPEN_HOURS,
+                    uncovered=lost,
+                )
+            )
+    affected_waitlist: list[PreviewAffectedWaitlistOut] = []
+    for row in waitlist:
+        lost = _uncovered(row["start_utc"], row["end_utc"])
+        if lost is not None:
+            affected_waitlist.append(
+                PreviewAffectedWaitlistOut(
+                    id=row["id"],
+                    start=utc_iso(row["start_utc"]),
+                    end=utc_iso(row["end_utc"]),
+                    rules_version=row["rules_version"],
+                    reason=PREVIEW_REASON_OUTSIDE_OPEN_HOURS,
+                    uncovered=lost,
+                )
+            )
+
+    return PublishPreviewOut(
+        point_id=point_id,
+        base_version=point["version"],
+        sampled_at=utc_iso(now),
+        timezone=timezone_name,
+        date_from=date_from,
+        date_to=date_to,
+        days=days_out,
+        affected_reservations=affected_reservations,
+        affected_locks=affected_locks,
+        affected_waitlist=affected_waitlist,
     )
 
 
